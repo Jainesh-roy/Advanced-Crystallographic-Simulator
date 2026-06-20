@@ -1,39 +1,27 @@
 #Lattice and form factors
 
 import numpy as np
+import periodictable
 
 def calculate_atomic_form_factor(element_symbol: str, theta_rad: np.ndarray, wavelength: float = 1.5406) -> np.ndarray:
     """
-    Computes the angle-dependent atomic scattering factor (f_j) using 
-    the 9-parameter analytical Cromer-Mann Gaussian approximation constants.
+    Computes the angle-dependent atomic scattering factor (f_0) automatically
+    using the periodictable library's native quantum scattering engine.
     """
-    coefficients = {
-        "Cu": [13.338, 3.582, 7.168, 0.247, 5.616, 11.397, 1.674, 64.813, 1.191],
-        "Ni": [12.838, 3.829, 6.810, 0.259, 5.565, 12.167, 1.595, 67.433, 1.171]
-    }
+    try:
+        # Fetch the official element object registry
+        element = getattr(periodictable, element_symbol)
+    except AttributeError:
+        raise ValueError(f"Element '{element_symbol}' is not a valid periodic table symbol.")
     
-    if element_symbol not in coefficients:
-        raise ValueError(f"Element '{element_symbol}' constants not defined.")
-        
-    p = coefficients[element_symbol]
+    # Calculate the scattering vector magnitude Q = 4 * pi * sin(theta) / lambda
+    q_vector = (4 * np.pi * np.sin(theta_rad)) / wavelength
     
-    # Calculate s^2 = (sin(theta) / lambda)^2
-    s_sq = (np.sin(theta_rad) / wavelength) ** 2
+    # Use the library's built-in vector-safe form factor calculator
+    # We apply np.vectorize to allow the library to evaluate entire arrays seamlessly
+    f0_calculator = np.vectorize(element.xray.f0)
+    f_j = f0_calculator(q_vector)
     
-    # Extract coefficients into distinct individual scalar variables
-    a1, b1 = p[0], p[1]
-    a2, b2 = p[2], p[3]
-    a3, b3 = p[4], p[5]
-    a4, b4 = p[6], p[7]
-    c_val  = p[8]
-
-    # Calculate each term using the distinct variables
-    term1 = a1 * np.exp(-b1 * s_sq)
-    term2 = a2 * np.exp(-b2 * s_sq)
-    term3 = a3 * np.exp(-b3 * s_sq)
-    term4 = a4 * np.exp(-b4 * s_sq)
-    
-    f_j = term1 + term2 + term3 + term4 + c_val
     return f_j
 
 def get_allowed_reflections(lattice_type: str) -> list:
@@ -82,3 +70,21 @@ if __name__ == "__main__":
     
     # Grab the very first index value from your array output
     print(f"Copper atomic scattering power at 22 deg: {float(f_cu[0]):.3f}")
+
+if __name__ == "__main__":
+    print("--- Testing Professional Open-Source Integrated Physics Module ---")
+    
+    # Test 1: Check standard FCC planes collection
+    fcc_planes = get_allowed_reflections("FCC")
+    print(f"Total allowed FCC reflections isolated: {len(fcc_planes)}")
+    
+    # Test 2: Evaluate ANY arbitrary element seamlessly without updating dictionary maps
+    sample_angle = np.radians(22.0)
+    
+    # Let's check Copper (Cu)
+    f_cu = calculate_atomic_form_factor("Cu", np.array([sample_angle]))
+    print(f"Copper atomic scattering factor at 22 deg: {float(f_cu[0]):.3f}")
+    
+    # Let's check Gold (Au) instantly!
+    f_au = calculate_atomic_form_factor("Au", np.array([sample_angle]))
+    print(f"Gold atomic scattering factor at 22 deg: {float(f_au[0]):.3f}")
