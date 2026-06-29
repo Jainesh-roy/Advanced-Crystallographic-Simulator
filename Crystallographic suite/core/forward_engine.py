@@ -1,259 +1,246 @@
-# Physics simulation logic
-
-
-
-"""
-core/forwardengine.py
-
-Structural theory & mathematical engine:
-- Vegard's law lattice parameter interpolation
-- sin^2(2θ) ratio-based cubic indexing helper
-- Objective residual matrix for least-squares refinement
-
-All functions are stateless and NumPy-friendly so they can be
-composed with other modules (form factors, structure factors,
-peak-profile engine, optimizers, etc.).
-"""
+# main.py
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal, Sequence, Tuple, Dict
+import argparse
+import sys
+from pathlib import Path
 
 import numpy as np
+from scipy.signal import find_peaks
+
+# Adjust these imports to match your actual package structure:
+from core.signal_processor import run_signal_pipeline
+from core.structural_physics import calculate_atomic_form_factor, get_allowed_reflections
+from core.forwardengine import (
+    classify_cubic_from_peaks,
+    simulate_xrd_pattern,
+    least_squares_cost,
+)
 
 
-# -------------------------------------------------------------------------
-# 1. Vegard's Law Implementation
-#    a_alloy = (1 − x) * a_A + x * a_B
-# -------------------------------------------------------------------------
-
-def vegards_law_lattice_parameter(
-    x: float,
-    a_A: float,
-    a_B: float
-) -> float:
+def load_xrd_text_file(file_path: str | Path) -> tuple[np.ndarray, np.ndarray]:
     """
-    Compute alloy lattice parameter using Vegard's law for a binary A_(1-x) B_x alloy.
-
-    Parameters
-    ----------
-    x : float
-        Mole fraction of species B in A_(1-x) B_x.
-        Expected range: 0.0 <= x <= 1.0
-    a_A : float
-        Lattice parameter of pure end-member A (same units as output).
-    a_B : float
-        Lattice parameter of pure end-member B (same units as output).
-
-    Returns
-    -------
-    float
-        Lattice parameter of the alloy a_alloy.
+    Load a raw XRD text file with two columns:
+    column 1 -> 2theta in degrees
+    column 2 -> intensity
     """
-    if not (0.0 <= x <= 1.0):
-        raise ValueError("Composition x must lie in [0, 1].")
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Data file not found: {file_path}")
 
-    a_alloy = (1.0 - x) * a_A + x * a_B
-    return a_alloy
+    # Try whitespace-delimited first, then fall back to comma
+    try:
+        data = np.loadtxt(file_path, delimiter=None)
+    except ValueError:
+        data = np.loadtxt(file_path, delimiter=",")
 
+    if data.ndim != 2 or data.shape[1] < 2:
+        raise ValueError("File must contain at least two numeric columns: 2theta, intensity.")
 
-# -------------------------------------------------------------------------
-# 2. sin^2(2θ) Ratio Indexing Engine
-#    Classify cubic system from peak positions
-# -------------------------------------------------------------------------
+    two_theta_deg = np.asarray(data[:, 0], dtype=float)
+    intensity = np.asarray(data[:, 1], dtype=float)
 
-CubicLattice = Literal["SC", "BCC", "FCC"]
+    if two_theta_deg.shape != intensity.shape:
+        raise ValueError("Angle and intensity arrays must have the same length.")
 
-
-@dataclass
-class CubicIndexingResult:
-    lattice_type: CubicLattice
-    scores: Dict[CubicLattice, float]
-    sin2theta: np.ndarray
-
-
-def _normalize_ratios(values: np.ndarray) -> np.ndarray:
-    """
-    Normalize a positive array to unit first element: r_i = values_i / values_0.
-
-    Used to compare experimental sin^2(2θ) ratios against ideal integer sequences.
-    """
-    values = np.asarray(values, dtype=float)
-    if values.ndim != 1:
-        raise ValueError("Input must be 1D.")
-    if len(values) == 0:
-        raise ValueError("Input array must be non-empty.")
-
-    # Guard against zero or negative leading value
-    v0 = values[0]
-    if v0 <= 0:
-        raise ValueError("First value must be positive for ratio normalization.")
-
-    return values / v0
+    return two_theta_deg, intensity
 
 
-def classify_cubic_from_peaks(
-    two_theta_deg: Sequence[float],
-    wavelength: float,
-    max_peaks: int | None = 5
-) -> CubicIndexingResult:
-    """
-    Classify an unknown cubic lattice as SC, BCC, or FCC using sin^2(2θ) ratios.
-
-    Parameters
-    ----------
-    two_theta_deg : Sequence[float]
-        Peak center positions in 2θ (degrees), sorted ascending. These should
-        be already baseline-corrected and identified by a peak-finder upstream.
-    wavelength : float
-        X-ray wavelength in same units as used elsewhere (e.g. Angstrom).
-        Included for completeness; here we only use angle ratios, so λ cancels.
-    max_peaks : int, optional
-        Maximum number of lowest-angle peaks to use in the ratio comparison.
-        Defaults to 5. If fewer peaks are provided, all will be used.
-
-    Returns
-    -------
-    CubicIndexingResult
-        lattice_type : "SC", "BCC", or "FCC" with smallest mismatch score.
-        scores       : mapping from lattice type to residual score.
-        sin2theta    : NumPy array of sin^2(2θ) used for the comparison.
-
-    Notes
-    -----
-    Ideal cubic sequences (proportional to h^2 + k^2 + l^2):
-
-    - SC  : 1, 2, 3, 4, 5, ...
-    - BCC : 2, 4, 6, 8, 10, ... (h^2+k^2+l^2 even)
-    - FCC : 3, 4, 8, 11, 12, ... (first few allowed sums)
-
-    Here we compare *normalized* experimental ratios to normalized versions
-    of these integer sequences using a simple least-squares mismatch.
-    """
-    # Convert to NumPy and trim to first few peaks
-    two_theta_deg = np.asarray(two_theta_deg, dtype=float)
-    if two_theta_deg.ndim != 1:
-        raise ValueError("two_theta_deg must be 1D.")
-    if len(two_theta_deg) < 2:
-        raise ValueError("At least two peak positions are required.")
-
-    if max_peaks is not None and max_peaks > 0:
-        two_theta_deg = two_theta_deg[:max_peaks]
-
-    # Compute sin^2(2θ) in radians; wavelength cancels for relative indexing
-    two_theta_rad = np.deg2rad(two_theta_deg)
-    sin2theta = np.sin(two_theta_rad) ** 2  # this is sin^2(2θ)
-
-    # Normalize experimental ratios
-    exp_ratios = _normalize_ratios(sin2theta)
-
-    n = len(exp_ratios)
-
-    # Ideal integer sequences (first n values)
-    sc_seq = np.arange(1, n + 1)                     # 1, 2, 3, ...
-    bcc_seq = 2 * np.arange(1, n + 1)                # 2, 4, 6, ...
-    fcc_base = np.array([3, 4, 8, 11, 12, 16, 19])   # extendable if needed
-    if n > len(fcc_base):
-        # Simple extension by approximate spacing; can be refined later
-        extra = np.arange(1, n - len(fcc_base) + 1) + fcc_base[-1]
-        fcc_seq = np.concatenate([fcc_base, extra])
-    else:
-        fcc_seq = fcc_base[:n]
-
-    # Normalize ideal sequences
-    sc_norm = _normalize_ratios(sc_seq)
-    bcc_norm = _normalize_ratios(bcc_seq)
-    fcc_norm = _normalize_ratios(fcc_seq)
-
-    # Compute simple least-squares mismatch between experimental and each ideal
-    def mismatch(a: np.ndarray, b: np.ndarray) -> float:
-        return float(np.sum((a - b) ** 2))
-
-    scores: Dict[CubicLattice, float] = {
-        "SC": mismatch(exp_ratios, sc_norm),
-        "BCC": mismatch(exp_ratios, bcc_norm),
-        "FCC": mismatch(exp_ratios, fcc_norm),
-    }
-
-    best_lattice: CubicLattice = min(scores, key=scores.get)  # type: ignore[arg-type]
-
-    return CubicIndexingResult(
-        lattice_type=best_lattice,
-        scores=scores,
-        sin2theta=sin2theta,
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="XRD cubic lattice identification and forward simulation orchestrator."
     )
 
+    parser.add_argument("file", help="Path to raw XRD text file (2theta, intensity).")
+    parser.add_argument(
+        "--wavelength",
+        type=float,
+        default=0.15406,  # ~Cu Kα in nm
+        help="X-ray wavelength in nm."
+    )
+    parser.add_argument(
+        "--element",
+        type=str,
+        default="Cu",
+        help="Element symbol for structure factor simulation (e.g., Cu, Fe)."
+    )
+    parser.add_argument(
+        "--lattice-a",
+        type=float,
+        default=0.3615,
+        help="Initial lattice parameter a in nm for forward simulation."
+    )
+    parser.add_argument(
+        "--crystallite",
+        type=float,
+        default=20.0,
+        help="Crystallite size in nm for Scherrer broadening."
+    )
+    parser.add_argument(
+        "--sg-window",
+        type=int,
+        default=15,
+        help="Savitzky-Golay window size."
+    )
+    parser.add_argument(
+        "--sg-order",
+        type=int,
+        default=4,
+        help="Savitzky-Golay polynomial order."
+    )
+    parser.add_argument(
+        "--prominence",
+        type=float,
+        default=20.0,
+        help="Minimum prominence for peak detection."
+    )
+    parser.add_argument(
+        "--width",
+        type=float,
+        default=2.0,
+        help="Minimum peak width (in index units) for peak detection."
+    )
+    parser.add_argument(
+        "--distance",
+        type=int,
+        default=5,
+        help="Minimum distance (in index units) between peaks."
+    )
+    parser.add_argument(
+        "--max-indexing-peaks",
+        type=int,
+        default=5,
+        help="Maximum number of lowest-angle peaks used for cubic indexing."
+    )
 
-# -------------------------------------------------------------------------
-# 3. Objective Refinement Matrix
-#    Least-squares cost S = Σ w_i * |y_exp - y_sim|^2
-# -------------------------------------------------------------------------
+    return parser
 
-def residual_vector(
-    y_exp: Sequence[float],
-    y_sim: Sequence[float],
-    weights: Sequence[float] | None = None
-) -> np.ndarray:
-    """
-    Compute weighted residual vector r_i = sqrt(w_i) * (y_exp_i - y_sim_i).
 
-    Parameters
-    ----------
-    y_exp : Sequence[float]
-        Experimental intensity array after cleaning/baseline subtraction.
-    y_sim : Sequence[float]
-        Simulated intensity array evaluated on the same x-grid as y_exp.
-    weights : Sequence[float], optional
-        Non-negative weights w_i (e.g. 1/σ_i^2). If None, all weights = 1.
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
 
-    Returns
-    -------
-    np.ndarray
-        Residual vector r suitable for passing into least-squares optimizers:
-        S = ||r||^2 = Σ w_i * (y_exp_i - y_sim_i)^2
-    """
-    y_exp = np.asarray(y_exp, dtype=float)
-    y_sim = np.asarray(y_sim, dtype=float)
+    # ----------------------------------------------------------------------
+    # 1. Load raw data
+    # ----------------------------------------------------------------------
+    try:
+        two_theta_deg, raw_intensity = load_xrd_text_file(args.file)
+    except Exception as exc:
+        print(f"Failed to load data: {exc}")
+        return 1
 
-    if y_exp.shape != y_sim.shape:
-        raise ValueError("y_exp and y_sim must have the same shape.")
+    # ----------------------------------------------------------------------
+    # 2. Run signal-processing pipeline (Savitzky-Golay + zero-point)
+    # ----------------------------------------------------------------------
+    signal_result = run_signal_pipeline(
+        two_theta_deg=two_theta_deg,
+        raw_intensity=raw_intensity,
+        measured_peaks_deg=None,
+        reference_peaks_deg=None,
+        window_size=args.sg_window,
+        poly_order=args.sg_order,
+    )
 
-    if weights is None:
-        w = np.ones_like(y_exp)
+    smoothed_intensity = signal_result["smoothed_intensity"]
+    corrected_two_theta = signal_result["corrected_two_theta"]
+    zero_shift = signal_result["zero_point_shift_deg"]
+
+    # For this main orchestration, treat smoothed_intensity as “cleaned” data.
+    corrected_intensity = smoothed_intensity
+
+    # ----------------------------------------------------------------------
+    # 3. Automated peak extraction with scipy.signal.find_peaks
+    # ----------------------------------------------------------------------
+    peak_indices, peak_props = find_peaks(
+        corrected_intensity,
+        prominence=args.prominence,
+        width=args.width,
+        distance=args.distance,
+    )
+
+    peak_positions_deg = corrected_two_theta[peak_indices]
+    peak_intensities = corrected_intensity[peak_indices]
+
+    if len(peak_positions_deg) < 2:
+        print("Not enough peaks detected for indexing; adjust peak parameters.")
+        return 1
+
+    # Sort peaks by angle and take the lowest-angle subset for indexing
+    sort_idx = np.argsort(peak_positions_deg)
+    peak_positions_sorted = peak_positions_deg[sort_idx]
+    peak_intensities_sorted = peak_intensities[sort_idx]
+    peak_positions_for_indexing = peak_positions_sorted[:args.max_indexing_peaks]
+
+    # ----------------------------------------------------------------------
+    # 4. Lattice classification using forwardengine.classify_cubic_from_peaks
+    # ----------------------------------------------------------------------
+    indexing_result = classify_cubic_from_peaks(
+        two_theta_deg=peak_positions_for_indexing,
+        max_peaks=args.max_indexing_peaks,
+    )
+
+    predicted_lattice = indexing_result.lattice_type
+    lattice_scores = indexing_result.scores
+
+    # ----------------------------------------------------------------------
+    # 5. Forward simulation for the predicted lattice
+    # ----------------------------------------------------------------------
+    sim_two_theta, sim_intensity = simulate_xrd_pattern(
+        lattice_type=predicted_lattice,
+        a_nm=args.lattice_a,
+        element=args.element,
+        crystallite_nm=args.crystallite,
+        wavelength=args.wavelength,
+        theta_min=float(corrected_two_theta.min()),
+        theta_max=float(corrected_two_theta.max()),
+        step=float(corrected_two_theta[1] - corrected_two_theta[0]),
+    )
+
+    # Interpolate simulated intensity onto the experimental grid
+    sim_on_exp_grid = np.interp(corrected_two_theta, sim_two_theta, sim_intensity)
+
+    # Normalize both patterns for fair comparison
+    if np.max(corrected_intensity) > 0:
+        corrected_norm = corrected_intensity / np.max(corrected_intensity)
     else:
-        w = np.asarray(weights, dtype=float)
-        if w.shape != y_exp.shape:
-            raise ValueError("weights must have the same shape as y_exp.")
-        if np.any(w < 0):
-            raise ValueError("weights must be non-negative.")
+        corrected_norm = corrected_intensity
 
-    resid = y_exp - y_sim
-    r = np.sqrt(w) * resid
-    return r
+    if np.max(sim_on_exp_grid) > 0:
+        sim_norm = sim_on_exp_grid / np.max(sim_on_exp_grid)
+    else:
+        sim_norm = sim_on_exp_grid
+
+    # ----------------------------------------------------------------------
+    # 6. Compute least-squares mismatch
+    # ----------------------------------------------------------------------
+    S = least_squares_cost(corrected_norm, sim_norm)
+
+    # ----------------------------------------------------------------------
+    # 7. Print consolidated analysis verdict
+    # ----------------------------------------------------------------------
+    print("\n--- XRD Cubic Lattice Analysis ---")
+    print(f"Data file             : {args.file}")
+    print(f"Number of data points : {len(two_theta_deg)}")
+    print(f"Zero-point shift      : {zero_shift:.4f} deg")
+    print(f"Detected peaks        : {len(peak_positions_deg)}")
+
+    print("\nFirst few peak positions (2θ deg):")
+    print(", ".join(f"{p:.3f}" for p in peak_positions_sorted[:args.max_indexing_peaks]))
+
+    print("\nCubic classification scores (lower is better):")
+    for lattice, score in lattice_scores.items():
+        print(f"  {lattice}: {score:.6e}")
+
+    print(f"\nPredicted lattice type: {predicted_lattice}")
+    print(f"Initial lattice parameter a (nm): {args.lattice_a:.6f}")
+    print(f"Crystallite size (nm): {args.crystallite:.2f}")
+
+    print(f"\nLeast-squares mismatch S between cleaned data and simulated profile: {S:.6e}")
+    print("------------------------------------------")
+
+    return 0
 
 
-def least_squares_cost(
-    y_exp: Sequence[float],
-    y_sim: Sequence[float],
-    weights: Sequence[float] | None = None
-) -> float:
-    """
-    Compute scalar least-squares objective S = Σ w_i * (y_exp_i - y_sim_i)^2.
-
-    Parameters
-    ----------
-    y_exp : Sequence[float]
-        Experimental intensity array after cleaning/baseline subtraction.
-    y_sim : Sequence[float]
-        Simulated intensity array evaluated on the same x-grid as y_exp.
-    weights : Sequence[float], optional
-        Non-negative weights w_i (e.g. 1/σ_i^2). If None, all weights = 1.
-
-    Returns
-    -------
-    float
-        Scalar cost S suitable for monitoring optimization progress.
-    """
-    r = residual_vector(y_exp, y_sim, weights=weights)
-    return float(np.dot(r, r))
+if __name__ == "__main__":
+    sys.exit(main())
