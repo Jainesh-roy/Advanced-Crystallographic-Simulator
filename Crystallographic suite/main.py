@@ -1,4 +1,5 @@
-# The orchestrator (combines everyone's work)# main.py
+# The orchestrator (combines everyone's work)
+# main.py
 
 from __future__ import annotations
 
@@ -56,8 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--wavelength",
         type=float,
-        default=0.15406,  # ~Cu Kα in nm
-        help="X-ray wavelength in nm."
+        default=1.5406,  # Cu Kα in Angstroms (matches structural_physics / forwardengine)
+        help="X-ray wavelength in Angstroms."
     )
     parser.add_argument(
         "--element",
@@ -68,8 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lattice-a",
         type=float,
-        default=0.3615,
-        help="Initial lattice parameter a in nm for forward simulation."
+        default=3.615,
+        help="Initial lattice parameter a in Angstroms for forward simulation (cubic)."
     )
     parser.add_argument(
         "--crystallite",
@@ -185,16 +186,20 @@ def main() -> int:
 
     # ----------------------------------------------------------------------
     # 5. Forward simulation for the predicted lattice
+    #    NOTE: updated to use simulate_xrd_pattern's new signature
+    #          (wavelength_angstrom, two_theta_* names).
     # ----------------------------------------------------------------------
     sim_two_theta, sim_intensity = simulate_xrd_pattern(
+        element_symbol=args.element,
         lattice_type=predicted_lattice,
-        a_nm=args.lattice_a,
-        element=args.element,
-        crystallite_nm=args.crystallite,
-        wavelength=args.wavelength,
-        theta_min=float(corrected_two_theta.min()),
-        theta_max=float(corrected_two_theta.max()),
-        step=float(corrected_two_theta[1] - corrected_two_theta[0]),
+        lattice_parameter_a=args.lattice_a,
+        wavelength_angstrom=args.wavelength,
+        two_theta_start_deg=float(corrected_two_theta.min()),
+        two_theta_stop_deg=float(corrected_two_theta.max()),
+        two_theta_step_deg=float(corrected_two_theta[1] - corrected_two_theta[0]),
+        peak_profile_function="Lorentzian",   # or make this a CLI argument later
+        instrument_fwhm_deg=0.15,             # could be exposed as CLI as well
+        crystallite_size_nm=args.crystallite,
     )
 
     # Interpolate simulated intensity onto the experimental grid
@@ -233,7 +238,7 @@ def main() -> int:
         print(f"  {lattice}: {score:.6e}")
 
     print(f"\nPredicted lattice type: {predicted_lattice}")
-    print(f"Initial lattice parameter a (nm): {args.lattice_a:.6f}")
+    print(f"Initial lattice parameter a (Å): {args.lattice_a:.4f}")
     print(f"Crystallite size (nm): {args.crystallite:.2f}")
 
     print(f"\nLeast-squares mismatch S between cleaned data and simulated profile: {S:.6e}")
