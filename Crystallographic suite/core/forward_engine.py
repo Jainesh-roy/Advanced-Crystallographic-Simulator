@@ -1,246 +1,110 @@
-# main.py
+"""
+core/forwardengine.py
 
-from __future__ import annotations
-
-import argparse
-import sys
-from pathlib import Path
+Structural theory & mathematical engine:
+- Vegard's law lattice parameter interpolation
+- sin^2(2θ) ratio-based cubic indexing
+- Objective residual matrix for least-squares
+- Core XRD synthetic profile simulation
+"""
 
 import numpy as np
-from scipy.signal import find_peaks
+import periodictable
+from typing import Literal, Sequence, Dict
+from dataclasses import dataclass
 
-# Adjust these imports to match your actual package structure:
-from core.signal_processor import run_signal_pipeline
-from core.structural_physics import calculate_atomic_form_factor, get_allowed_reflections
-from core.forwardengine import (
-    classify_cubic_from_peaks,
-    simulate_xrd_pattern,
-    least_squares_cost,
-)
-
-
-def load_xrd_text_file(file_path: str | Path) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Load a raw XRD text file with two columns:
-    column 1 -> 2theta in degrees
-    column 2 -> intensity
-    """
-    file_path = Path(file_path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"Data file not found: {file_path}")
-
-    # Try whitespace-delimited first, then fall back to comma
-    try:
-        data = np.loadtxt(file_path, delimiter=None)
-    except ValueError:
-        data = np.loadtxt(file_path, delimiter=",")
-
-    if data.ndim != 2 or data.shape[1] < 2:
-        raise ValueError("File must contain at least two numeric columns: 2theta, intensity.")
-
-    two_theta_deg = np.asarray(data[:, 0], dtype=float)
-    intensity = np.asarray(data[:, 1], dtype=float)
-
-    if two_theta_deg.shape != intensity.shape:
-        raise ValueError("Angle and intensity arrays must have the same length.")
-
-    return two_theta_deg, intensity
+# 1. Vegard's Law Implementation
+def vegards_law_lattice_parameter(x: float, a_A: float, a_B: float) -> float:
+    """Compute alloy lattice parameter using Vegard's law."""
+    if not (0.0 <= x <= 1.0):
+        raise ValueError("Composition x must lie in [0, 1].")
+    return (1.0 - x) * a_A + x * a_B
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="XRD cubic lattice identification and forward simulation orchestrator."
-    )
+# 2. Cubic Indexing Core
+CubicLattice = Literal["SC", "BCC", "FCC"]
 
-    parser.add_argument("file", help="Path to raw XRD text file (2theta, intensity).")
-    parser.add_argument(
-        "--wavelength",
-        type=float,
-        default=0.15406,  # ~Cu Kα in nm
-        help="X-ray wavelength in nm."
-    )
-    parser.add_argument(
-        "--element",
-        type=str,
-        default="Cu",
-        help="Element symbol for structure factor simulation (e.g., Cu, Fe)."
-    )
-    parser.add_argument(
-        "--lattice-a",
-        type=float,
-        default=0.3615,
-        help="Initial lattice parameter a in nm for forward simulation."
-    )
-    parser.add_argument(
-        "--crystallite",
-        type=float,
-        default=20.0,
-        help="Crystallite size in nm for Scherrer broadening."
-    )
-    parser.add_argument(
-        "--sg-window",
-        type=int,
-        default=15,
-        help="Savitzky-Golay window size."
-    )
-    parser.add_argument(
-        "--sg-order",
-        type=int,
-        default=4,
-        help="Savitzky-Golay polynomial order."
-    )
-    parser.add_argument(
-        "--prominence",
-        type=float,
-        default=20.0,
-        help="Minimum prominence for peak detection."
-    )
-    parser.add_argument(
-        "--width",
-        type=float,
-        default=2.0,
-        help="Minimum peak width (in index units) for peak detection."
-    )
-    parser.add_argument(
-        "--distance",
-        type=int,
-        default=5,
-        help="Minimum distance (in index units) between peaks."
-    )
-    parser.add_argument(
-        "--max-indexing-peaks",
-        type=int,
-        default=5,
-        help="Maximum number of lowest-angle peaks used for cubic indexing."
-    )
+@dataclass
+class CubicIndexingResult:
+    lattice_type: CubicLattice
+    scores: Dict[CubicLattice, float]
+    sin2theta: np.ndarray
 
-    return parser
+def _normalize_ratios(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    return values / values[0]
+
+def classify_cubic_from_peaks(two_theta_deg: Sequence[float], max_peaks: int = 5) -> CubicIndexingResult:
+    two_theta_deg = np.asarray(two_theta_deg, dtype=float)[:max_peaks]
+    sin2theta = np.sin(np.deg2rad(two_theta_deg) / 2.0) ** 2 
+    
+    exp_ratios = _normalize_ratios(sin2theta)
+    n = len(exp_ratios)
+    
+    sc_seq = np.arange(1, n + 1)
+    bcc_seq = 2 * np.arange(1, n + 1)
+    fcc_seq = np.array([3, 4, 8, 11, 12, 16, 19])[:n]
+    
+    scores = {
+        "SC": float(np.sum((exp_ratios - _normalize_ratios(sc_seq)) ** 2)),
+        "BCC": float(np.sum((exp_ratios - _normalize_ratios(bcc_seq)) ** 2)),
+        "FCC": float(np.sum((exp_ratios - _normalize_ratios(fcc_seq)) ** 2)),
+    }
+    best_lattice = min(scores, key=scores.get)
+    return CubicIndexingResult(lattice_type=best_lattice, scores=scores, sin2theta=sin2theta)
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-
-    # ----------------------------------------------------------------------
-    # 1. Load raw data
-    # ----------------------------------------------------------------------
-    try:
-        two_theta_deg, raw_intensity = load_xrd_text_file(args.file)
-    except Exception as exc:
-        print(f"Failed to load data: {exc}")
-        return 1
-
-    # ----------------------------------------------------------------------
-    # 2. Run signal-processing pipeline (Savitzky-Golay + zero-point)
-    # ----------------------------------------------------------------------
-    signal_result = run_signal_pipeline(
-        two_theta_deg=two_theta_deg,
-        raw_intensity=raw_intensity,
-        measured_peaks_deg=None,
-        reference_peaks_deg=None,
-        window_size=args.sg_window,
-        poly_order=args.sg_order,
-    )
-
-    smoothed_intensity = signal_result["smoothed_intensity"]
-    corrected_two_theta = signal_result["corrected_two_theta"]
-    zero_shift = signal_result["zero_point_shift_deg"]
-
-    # For this main orchestration, treat smoothed_intensity as “cleaned” data.
-    corrected_intensity = smoothed_intensity
-
-    # ----------------------------------------------------------------------
-    # 3. Automated peak extraction with scipy.signal.find_peaks
-    # ----------------------------------------------------------------------
-    peak_indices, peak_props = find_peaks(
-        corrected_intensity,
-        prominence=args.prominence,
-        width=args.width,
-        distance=args.distance,
-    )
-
-    peak_positions_deg = corrected_two_theta[peak_indices]
-    peak_intensities = corrected_intensity[peak_indices]
-
-    if len(peak_positions_deg) < 2:
-        print("Not enough peaks detected for indexing; adjust peak parameters.")
-        return 1
-
-    # Sort peaks by angle and take the lowest-angle subset for indexing
-    sort_idx = np.argsort(peak_positions_deg)
-    peak_positions_sorted = peak_positions_deg[sort_idx]
-    peak_intensities_sorted = peak_intensities[sort_idx]
-    peak_positions_for_indexing = peak_positions_sorted[:args.max_indexing_peaks]
-
-    # ----------------------------------------------------------------------
-    # 4. Lattice classification using forwardengine.classify_cubic_from_peaks
-    # ----------------------------------------------------------------------
-    indexing_result = classify_cubic_from_peaks(
-        two_theta_deg=peak_positions_for_indexing,
-        max_peaks=args.max_indexing_peaks,
-    )
-
-    predicted_lattice = indexing_result.lattice_type
-    lattice_scores = indexing_result.scores
-
-    # ----------------------------------------------------------------------
-    # 5. Forward simulation for the predicted lattice
-    # ----------------------------------------------------------------------
-    sim_two_theta, sim_intensity = simulate_xrd_pattern(
-        lattice_type=predicted_lattice,
-        a_nm=args.lattice_a,
-        element=args.element,
-        crystallite_nm=args.crystallite,
-        wavelength=args.wavelength,
-        theta_min=float(corrected_two_theta.min()),
-        theta_max=float(corrected_two_theta.max()),
-        step=float(corrected_two_theta[1] - corrected_two_theta[0]),
-    )
-
-    # Interpolate simulated intensity onto the experimental grid
-    sim_on_exp_grid = np.interp(corrected_two_theta, sim_two_theta, sim_intensity)
-
-    # Normalize both patterns for fair comparison
-    if np.max(corrected_intensity) > 0:
-        corrected_norm = corrected_intensity / np.max(corrected_intensity)
-    else:
-        corrected_norm = corrected_intensity
-
-    if np.max(sim_on_exp_grid) > 0:
-        sim_norm = sim_on_exp_grid / np.max(sim_on_exp_grid)
-    else:
-        sim_norm = sim_on_exp_grid
-
-    # ----------------------------------------------------------------------
-    # 6. Compute least-squares mismatch
-    # ----------------------------------------------------------------------
-    S = least_squares_cost(corrected_norm, sim_norm)
-
-    # ----------------------------------------------------------------------
-    # 7. Print consolidated analysis verdict
-    # ----------------------------------------------------------------------
-    print("\n--- XRD Cubic Lattice Analysis ---")
-    print(f"Data file             : {args.file}")
-    print(f"Number of data points : {len(two_theta_deg)}")
-    print(f"Zero-point shift      : {zero_shift:.4f} deg")
-    print(f"Detected peaks        : {len(peak_positions_deg)}")
-
-    print("\nFirst few peak positions (2θ deg):")
-    print(", ".join(f"{p:.3f}" for p in peak_positions_sorted[:args.max_indexing_peaks]))
-
-    print("\nCubic classification scores (lower is better):")
-    for lattice, score in lattice_scores.items():
-        print(f"  {lattice}: {score:.6e}")
-
-    print(f"\nPredicted lattice type: {predicted_lattice}")
-    print(f"Initial lattice parameter a (nm): {args.lattice_a:.6f}")
-    print(f"Crystallite size (nm): {args.crystallite:.2f}")
-
-    print(f"\nLeast-squares mismatch S between cleaned data and simulated profile: {S:.6e}")
-    print("------------------------------------------")
-
-    return 0
+# 3. Residual Matrix
+def least_squares_cost(y_exp: Sequence[float], y_sim: Sequence[float], weights: Sequence[float] = None) -> float:
+    """Objective residual tracking function S = wi |y_exp - y_sim|^2"""
+    y_exp, y_sim = np.asarray(y_exp), np.asarray(y_sim)
+    w = np.ones_like(y_exp) if weights is None else np.asarray(weights)
+    r = np.sqrt(w) * (y_exp - y_sim)
+    return float(np.dot(r, r))
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+# 4. Multi-Physics Forward Profile Generator
+def calculate_atomic_form_factor(element_symbol: str, theta_rad: np.ndarray, wavelength: float = 1.5406) -> np.ndarray:
+    element = getattr(periodictable, element_symbol)
+    q_vector = (4 * np.pi * np.sin(theta_rad)) / wavelength
+    return np.vectorize(element.xray.f0)(q_vector)
+
+def get_allowed_reflections(lattice_type: str) -> list:
+    allowed_planes = []
+    for h in range(5):
+        for k in range(5):
+            for l in range(5):
+                if h == 0 and k == 0 and l == 0: continue
+                if lattice_type == "SC": allowed_planes.append((h, k, l))
+                elif lattice_type == "BCC" and (h + k + l) % 2 == 0: allowed_planes.append((h, k, l))
+                elif lattice_type == "FCC" and (h % 2 == k % 2 == l % 2): allowed_planes.append((h, k, l))
+    return allowed_planes
+
+def lorentzian_profile(two_theta: np.ndarray, peak_center: float, fwhm: float, intensity: float) -> np.ndarray:
+    gamma = fwhm / 2.0
+    return intensity * (gamma**2 / ((two_theta - peak_center)**2 + gamma**2))
+
+def simulate_xrd_pattern(lattice_type: str, a_nm: float, element: str, 
+                         crystallite_nm: float, wavelength: float = 1.5406,
+                         theta_min: float = 20, theta_max: float = 100, step: float = 0.05):
+    two_theta = np.arange(theta_min, theta_max, step)
+    intensity_total = np.zeros_like(two_theta)
+    
+    for h, k, l in get_allowed_reflections(lattice_type):
+        d_spacing = (a_nm * 10.0) / np.sqrt(h**2 + k**2 + l**2)
+        if d_spacing <= wavelength / 2.0: continue
+            
+        theta_rad = np.arcsin(wavelength / (2.0 * d_spacing))
+        peak_center_deg = np.degrees(2.0 * theta_rad)
+        if not (theta_min <= peak_center_deg <= theta_max): continue
+            
+        f_j = calculate_atomic_form_factor(element, np.array([theta_rad]), wavelength)[0]
+        peak_intensity = f_j**2
+        
+        # Microstructural Peak Broadening (Scherrer Equation)
+        fwhm_rad = (0.9 * wavelength) / (crystallite_nm * 10.0 * np.cos(theta_rad))
+        fwhm_deg = np.degrees(fwhm_rad)
+        
+        intensity_total += lorentzian_profile(two_theta, peak_center_deg, fwhm_deg, peak_intensity)
+        
+    return two_theta, intensity_total
