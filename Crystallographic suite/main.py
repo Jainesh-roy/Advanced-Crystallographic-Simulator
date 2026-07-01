@@ -1,6 +1,3 @@
-# The orchestrator (combines everyone's work)
-# main.py
-
 from __future__ import annotations
 
 import argparse
@@ -8,242 +5,145 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from scipy.signal import find_peaks
 
-# Adjust these imports to match your actual package structure:
-from core.signal_processor import run_signal_pipeline
-from core.structural_physics import calculate_atomic_form_factor, get_allowed_reflections
-from core.forwardengine import (
-    classify_cubic_from_peaks,
+from core.forward_engine import (
+    calculate_xrd_peaks,
     simulate_xrd_pattern,
-    least_squares_cost,
+    vegards_law_lattice_parameter,
 )
-
-
-def load_xrd_text_file(file_path: str | Path) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Load a raw XRD text file with two columns:
-    column 1 -> 2theta in degrees
-    column 2 -> intensity
-    """
-    file_path = Path(file_path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"Data file not found: {file_path}")
-
-    # Try whitespace-delimited first, then fall back to comma
-    try:
-        data = np.loadtxt(file_path, delimiter=None)
-    except ValueError:
-        data = np.loadtxt(file_path, delimiter=",")
-
-    if data.ndim != 2 or data.shape[1] < 2:
-        raise ValueError("File must contain at least two numeric columns: 2theta, intensity.")
-
-    two_theta_deg = np.asarray(data[:, 0], dtype=float)
-    intensity = np.asarray(data[:, 1], dtype=float)
-
-    if two_theta_deg.shape != intensity.shape:
-        raise ValueError("Angle and intensity arrays must have the same length.")
-
-    return two_theta_deg, intensity
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="XRD cubic lattice identification and forward simulation orchestrator."
+        description="Phase 1 cubic XRD forward simulator for SC/BCC/FCC crystals."
     )
 
-    parser.add_argument("file", help="Path to raw XRD text file (2theta, intensity).")
-    parser.add_argument(
-        "--wavelength",
-        type=float,
-        default=1.5406,  # Cu Kα in Angstroms (matches structural_physics / forwardengine)
-        help="X-ray wavelength in Angstroms."
-    )
-    parser.add_argument(
-        "--element",
-        type=str,
-        default="Cu",
-        help="Element symbol for structure factor simulation (e.g., Cu, Fe)."
-    )
-    parser.add_argument(
-        "--lattice-a",
-        type=float,
-        default=3.615,
-        help="Initial lattice parameter a in Angstroms for forward simulation (cubic)."
-    )
-    parser.add_argument(
-        "--crystallite",
-        type=float,
-        default=20.0,
-        help="Crystallite size in nm for Scherrer broadening."
-    )
-    parser.add_argument(
-        "--sg-window",
-        type=int,
-        default=15,
-        help="Savitzky-Golay window size."
-    )
-    parser.add_argument(
-        "--sg-order",
-        type=int,
-        default=4,
-        help="Savitzky-Golay polynomial order."
-    )
-    parser.add_argument(
-        "--prominence",
-        type=float,
-        default=20.0,
-        help="Minimum prominence for peak detection."
-    )
-    parser.add_argument(
-        "--width",
-        type=float,
-        default=2.0,
-        help="Minimum peak width (in index units) for peak detection."
-    )
-    parser.add_argument(
-        "--distance",
-        type=int,
-        default=5,
-        help="Minimum distance (in index units) between peaks."
-    )
-    parser.add_argument(
-        "--max-indexing-peaks",
-        type=int,
-        default=5,
-        help="Maximum number of lowest-angle peaks used for cubic indexing."
-    )
+    parser.add_argument("--crystal-name", default="User crystal", help="Display name for the crystal/material.")
+    parser.add_argument("--element", default="Cu", help="Primary element symbol, e.g. Cu, Fe, Au.")
+    parser.add_argument("--element-b", default=None, help="Optional B element for A(1-x)B(x) solid solutions.")
+    parser.add_argument("--composition-x", type=float, default=None, help="Optional B fraction x for A(1-x)B(x).")
+    parser.add_argument("--lattice-type", choices=["SC", "BCC", "FCC"], default="FCC", help="Cubic lattice type.")
+    parser.add_argument("--lattice-a", type=float, default=3.615, help="Cubic lattice parameter a in Angstroms.")
+    parser.add_argument("--lattice-a-A", type=float, default=None, help="Endpoint lattice parameter a_A for Vegard's law.")
+    parser.add_argument("--lattice-a-B", type=float, default=None, help="Endpoint lattice parameter a_B for Vegard's law.")
+    parser.add_argument("--wavelength", type=float, default=1.5406, help="X-ray wavelength in Angstroms.")
+    parser.add_argument("--crystallite", type=float, default=20.0, help="Crystallite size in nm, typically 10 to 100.")
+    parser.add_argument("--two-theta-start", type=float, default=20.0, help="Start angle for simulated 2theta scan.")
+    parser.add_argument("--two-theta-stop", type=float, default=90.0, help="Stop angle for simulated 2theta scan.")
+    parser.add_argument("--two-theta-step", type=float, default=0.02, help="Step size for simulated 2theta scan.")
+    parser.add_argument("--profile", choices=["Gaussian", "Lorentzian"], default="Lorentzian", help="Peak profile.")
+    parser.add_argument("--instrument-fwhm", type=float, default=0.15, help="Instrumental FWHM broadening in degrees.")
+    parser.add_argument("--b-iso", type=float, default=0.5, help="Isotropic Debye-Waller B factor in Angstrom^2.")
+    parser.add_argument("--max-index", type=int, default=6, help="Maximum Miller index used for generated reflections.")
+    parser.add_argument("--output-profile", default=None, help="Optional CSV path for simulated profile output.")
 
     return parser
+
+
+def resolve_lattice_parameter(args: argparse.Namespace) -> float:
+    if args.composition_x is None:
+        return args.lattice_a
+
+    if args.lattice_a_A is None or args.lattice_a_B is None:
+        raise ValueError("Vegard's law requires --lattice-a-A and --lattice-a-B with --composition-x.")
+
+    return vegards_law_lattice_parameter(args.composition_x, args.lattice_a_A, args.lattice_a_B)
+
+
+def save_profile(path: str, two_theta: np.ndarray, intensity: np.ndarray) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savetxt(
+        output_path,
+        np.column_stack([two_theta, intensity]),
+        delimiter=",",
+        header="two_theta_deg,intensity",
+        comments="",
+    )
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    # ----------------------------------------------------------------------
-    # 1. Load raw data
-    # ----------------------------------------------------------------------
     try:
-        two_theta_deg, raw_intensity = load_xrd_text_file(args.file)
+        lattice_a = resolve_lattice_parameter(args)
+        sim_two_theta, sim_intensity = simulate_xrd_pattern(
+            element_symbol=args.element,
+            element_b=args.element_b,
+            composition_x=args.composition_x,
+            lattice_type=args.lattice_type,
+            lattice_parameter_a=lattice_a,
+            wavelength_angstrom=args.wavelength,
+            two_theta_start_deg=args.two_theta_start,
+            two_theta_stop_deg=args.two_theta_stop,
+            two_theta_step_deg=args.two_theta_step,
+            peak_profile_function=args.profile,
+            instrument_fwhm_deg=args.instrument_fwhm,
+            crystallite_size_nm=args.crystallite,
+            max_index=args.max_index,
+            b_iso=args.b_iso,
+        )
+        peaks = calculate_xrd_peaks(
+            element_symbol=args.element,
+            element_b=args.element_b,
+            composition_x=args.composition_x,
+            lattice_type=args.lattice_type,
+            lattice_parameter_a=lattice_a,
+            wavelength_angstrom=args.wavelength,
+            two_theta_start_deg=args.two_theta_start,
+            two_theta_stop_deg=args.two_theta_stop,
+            instrument_fwhm_deg=args.instrument_fwhm,
+            crystallite_size_nm=args.crystallite,
+            max_index=args.max_index,
+            b_iso=args.b_iso,
+        )
     except Exception as exc:
-        print(f"Failed to load data: {exc}")
+        print(f"Failed to simulate XRD pattern: {exc}")
         return 1
 
-    # ----------------------------------------------------------------------
-    # 2. Run signal-processing pipeline (Savitzky-Golay + zero-point)
-    # ----------------------------------------------------------------------
-    signal_result = run_signal_pipeline(
-        two_theta_deg=two_theta_deg,
-        raw_intensity=raw_intensity,
-        measured_peaks_deg=None,
-        reference_peaks_deg=None,
-        window_size=args.sg_window,
-        poly_order=args.sg_order,
-    )
+    print("\n--- Phase 1: Cubic XRD Forward Simulation ---")
+    print(f"Crystal name          : {args.crystal_name}")
+    print(f"Composition           : {args.element}" + (f"(1-x){args.element_b}(x), x={args.composition_x:.4f}" if args.composition_x is not None else ""))
+    print(f"Lattice type          : {args.lattice_type}")
+    print(f"Lattice parameter a   : {lattice_a:.4f} Angstrom")
+    print(f"Wavelength            : {args.wavelength:.4f} Angstrom")
+    print(f"Crystallite size      : {args.crystallite:.2f} nm")
+    print(f"Instrument FWHM       : {args.instrument_fwhm:.4f} deg")
+    print(f"Debye-Waller B_iso    : {args.b_iso:.4f} Angstrom^2")
+    print(f"Peak profile          : {args.profile}")
+    print(f"2theta range          : {args.two_theta_start:.2f} to {args.two_theta_stop:.2f} deg")
+    print(f"2theta step           : {args.two_theta_step:.4f} deg")
+    print(f"Max Miller index      : {args.max_index}")
+    print(f"Allowed peak families : {len(peaks)}")
 
-    smoothed_intensity = signal_result["smoothed_intensity"]
-    corrected_two_theta = signal_result["corrected_two_theta"]
-    zero_shift = signal_result["zero_point_shift_deg"]
-
-    # For this main orchestration, treat smoothed_intensity as “cleaned” data.
-    corrected_intensity = smoothed_intensity
-
-    # ----------------------------------------------------------------------
-    # 3. Automated peak extraction with scipy.signal.find_peaks
-    # ----------------------------------------------------------------------
-    peak_indices, peak_props = find_peaks(
-        corrected_intensity,
-        prominence=args.prominence,
-        width=args.width,
-        distance=args.distance,
-    )
-
-    peak_positions_deg = corrected_two_theta[peak_indices]
-    peak_intensities = corrected_intensity[peak_indices]
-
-    if len(peak_positions_deg) < 2:
-        print("Not enough peaks detected for indexing; adjust peak parameters.")
-        return 1
-
-    # Sort peaks by angle and take the lowest-angle subset for indexing
-    sort_idx = np.argsort(peak_positions_deg)
-    peak_positions_sorted = peak_positions_deg[sort_idx]
-    peak_intensities_sorted = peak_intensities[sort_idx]
-    peak_positions_for_indexing = peak_positions_sorted[:args.max_indexing_peaks]
-
-    # ----------------------------------------------------------------------
-    # 4. Lattice classification using forwardengine.classify_cubic_from_peaks
-    # ----------------------------------------------------------------------
-    indexing_result = classify_cubic_from_peaks(
-        two_theta_deg=peak_positions_for_indexing,
-        max_peaks=args.max_indexing_peaks,
-    )
-
-    predicted_lattice = indexing_result.lattice_type
-    lattice_scores = indexing_result.scores
-
-    # ----------------------------------------------------------------------
-    # 5. Forward simulation for the predicted lattice
-    #    NOTE: updated to use simulate_xrd_pattern's new signature
-    #          (wavelength_angstrom, two_theta_* names).
-    # ----------------------------------------------------------------------
-    sim_two_theta, sim_intensity = simulate_xrd_pattern(
-        element_symbol=args.element,
-        lattice_type=predicted_lattice,
-        lattice_parameter_a=args.lattice_a,
-        wavelength_angstrom=args.wavelength,
-        two_theta_start_deg=float(corrected_two_theta.min()),
-        two_theta_stop_deg=float(corrected_two_theta.max()),
-        two_theta_step_deg=float(corrected_two_theta[1] - corrected_two_theta[0]),
-        peak_profile_function="Lorentzian",   # or make this a CLI argument later
-        instrument_fwhm_deg=0.15,             # could be exposed as CLI as well
-        crystallite_size_nm=args.crystallite,
-    )
-
-    # Interpolate simulated intensity onto the experimental grid
-    sim_on_exp_grid = np.interp(corrected_two_theta, sim_two_theta, sim_intensity)
-
-    # Normalize both patterns for fair comparison
-    if np.max(corrected_intensity) > 0:
-        corrected_norm = corrected_intensity / np.max(corrected_intensity)
+    if peaks:
+        max_intensity = max(peak.relative_intensity for peak in peaks)
+        print("\nSimulated peak table:")
+        print(" h k l | mult | 2theta(deg) | d(A)     | f0       | |F|      | LP       | DW       | rel.int(%) | FWHM(deg)")
+        print("-------|------|-------------|----------|----------|----------|----------|----------|------------|----------")
+        for peak in peaks:
+            rel_percent = 100.0 * peak.relative_intensity / max_intensity if max_intensity > 0 else 0.0
+            print(
+                f" {peak.h:1d} {peak.k:1d} {peak.l:1d} |"
+                f" {peak.multiplicity:4d} |"
+                f" {peak.two_theta_deg:11.3f} |"
+                f" {peak.d_spacing_angstrom:8.4f} |"
+                f" {peak.form_factor:8.3f} |"
+                f" {peak.structure_factor_abs:8.3f} |"
+                f" {peak.lorentz_polarization:8.3f} |"
+                f" {peak.debye_waller:8.3f} |"
+                f" {rel_percent:10.2f} |"
+                f" {peak.fwhm_deg:8.4f}"
+            )
     else:
-        corrected_norm = corrected_intensity
+        print("\nNo peaks fall inside the selected 2theta range.")
 
-    if np.max(sim_on_exp_grid) > 0:
-        sim_norm = sim_on_exp_grid / np.max(sim_on_exp_grid)
-    else:
-        sim_norm = sim_on_exp_grid
+    if args.output_profile:
+        save_profile(args.output_profile, sim_two_theta, sim_intensity)
+        print(f"\nSaved simulated profile: {args.output_profile}")
 
-    # ----------------------------------------------------------------------
-    # 6. Compute least-squares mismatch
-    # ----------------------------------------------------------------------
-    S = least_squares_cost(corrected_norm, sim_norm)
-
-    # ----------------------------------------------------------------------
-    # 7. Print consolidated analysis verdict
-    # ----------------------------------------------------------------------
-    print("\n--- XRD Cubic Lattice Analysis ---")
-    print(f"Data file             : {args.file}")
-    print(f"Number of data points : {len(two_theta_deg)}")
-    print(f"Zero-point shift      : {zero_shift:.4f} deg")
-    print(f"Detected peaks        : {len(peak_positions_deg)}")
-
-    print("\nFirst few peak positions (2θ deg):")
-    print(", ".join(f"{p:.3f}" for p in peak_positions_sorted[:args.max_indexing_peaks]))
-
-    print("\nCubic classification scores (lower is better):")
-    for lattice, score in lattice_scores.items():
-        print(f"  {lattice}: {score:.6e}")
-
-    print(f"\nPredicted lattice type: {predicted_lattice}")
-    print(f"Initial lattice parameter a (Å): {args.lattice_a:.4f}")
-    print(f"Crystallite size (nm): {args.crystallite:.2f}")
-
-    print(f"\nLeast-squares mismatch S between cleaned data and simulated profile: {S:.6e}")
-    print("------------------------------------------")
-
+    print("---------------------------------------------")
     return 0
 
 
