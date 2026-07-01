@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+import matplotlib.pyplot as plt
 
 import numpy as np
 
@@ -36,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--b-iso", type=float, default=0.5, help="Isotropic Debye-Waller B factor in Angstrom^2.")
     parser.add_argument("--max-index", type=int, default=6, help="Maximum Miller index used for generated reflections.")
     parser.add_argument("--output-profile", default=None, help="Optional CSV path for simulated profile output.")
+    parser.add_argument("--output-plot", default=None, help="Optional PNG/PDF path for the XRD plot.")
 
     return parser
 
@@ -60,6 +62,61 @@ def save_profile(path: str, two_theta: np.ndarray, intensity: np.ndarray) -> Non
         header="two_theta_deg,intensity",
         comments="",
     )
+
+def save_xrd_plot(
+    path: str,
+    two_theta: np.ndarray,
+    intensity: np.ndarray,
+    max_intensity: float = 2.5,
+):
+    """
+    Save the simulated XRD profile as a publication-style plot.
+
+    Parameters
+    ----------
+    path : str
+        Output image filename (.png/.pdf/.svg)
+    two_theta : ndarray
+        2θ values (degrees)
+    intensity : ndarray
+        Simulated intensity
+    max_intensity : float
+        Maximum value after normalization.
+    """
+
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Normalize intensity
+    if np.max(intensity) > 0:
+        intensity_norm = intensity / np.max(intensity) * max_intensity
+    else:
+        intensity_norm = intensity
+
+    plt.figure(figsize=(10, 6))
+
+    plt.plot(
+        two_theta,
+        intensity_norm,
+        color="black",
+        linewidth=1.5,
+    )
+
+    plt.xlabel(r"2$\theta$ (degrees)", fontsize=14)
+    plt.ylabel("Intensity (a.u.)", fontsize=14)
+
+    plt.xlim(0, 90)
+    plt.ylim(0, max_intensity)
+
+    plt.xticks(fontsize=12)
+    plt.yticks(fontsize=12)
+
+    plt.grid(False)
+
+    plt.tight_layout()
+
+    plt.savefig(output_path, dpi=300)
+    plt.close()
 
 
 def main() -> int:
@@ -142,6 +199,10 @@ def main() -> int:
     if args.output_profile:
         save_profile(args.output_profile, sim_two_theta, sim_intensity)
         print(f"\nSaved simulated profile: {args.output_profile}")
+
+    if args.output_plot:
+        save_xrd_plot(args.output_plot, sim_two_theta, sim_intensity)
+        print(f"Saved XRD plot: {args.output_plot}")
 
     print("---------------------------------------------")
     return 0
