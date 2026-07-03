@@ -298,3 +298,36 @@ def simulate_xrd_pattern(
         intensity_total += profile
 
     return two_theta_deg, intensity_total
+
+
+def add_realistic_xrd_artifacts(
+    two_theta_deg: np.ndarray,
+    intensity: np.ndarray,
+    noise_fraction: float = 0.025,
+    background_fraction: float = 0.04,
+    slope_fraction: float = 0.015,
+    random_seed: int | None = 42,
+) -> np.ndarray:
+    """
+    Add a mild background and counting noise so the profile resembles lab XRD.
+
+    The peak positions and peak areas still come from the forward model; this
+    function only decorates the displayed/saved graph with experimental-looking
+    baseline and stochastic noise.
+    """
+    if noise_fraction < 0 or background_fraction < 0 or slope_fraction < 0:
+        raise ValueError("Noise and background fractions must be non-negative.")
+
+    max_intensity = float(np.max(intensity)) if np.max(intensity) > 0 else 1.0
+    span = float(two_theta_deg[-1] - two_theta_deg[0])
+    x_norm = (two_theta_deg - two_theta_deg[0]) / span if span > 0 else np.zeros_like(two_theta_deg)
+
+    broad_background = background_fraction * max_intensity * (1.0 + 0.35 * np.sin(2.0 * np.pi * x_norm))
+    sloped_background = slope_fraction * max_intensity * x_norm
+
+    rng = np.random.default_rng(random_seed)
+    counting_sigma = noise_fraction * np.sqrt(np.clip(intensity + broad_background, 0.0, None) / max_intensity) * max_intensity
+    electronic_sigma = 0.2 * noise_fraction * max_intensity
+    noise = rng.normal(0.0, counting_sigma + electronic_sigma)
+
+    return np.clip(intensity + broad_background + sloped_background + noise, 0.0, None)

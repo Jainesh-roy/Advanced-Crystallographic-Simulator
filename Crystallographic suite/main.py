@@ -3,15 +3,28 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-import matplotlib.pyplot as plt
 
 import numpy as np
 
 from core.forward_engine import (
+    add_realistic_xrd_artifacts,
     calculate_xrd_peaks,
     simulate_xrd_pattern,
     vegards_law_lattice_parameter,
 )
+
+MATERIAL_PRESETS = {
+    ("Cu", "FCC"): {"lattice_a": 3.615, "crystallite": 45.0},
+    ("Ni", "FCC"): {"lattice_a": 3.524, "crystallite": 45.0},
+    ("Al", "FCC"): {"lattice_a": 4.049, "crystallite": 50.0},
+    ("Ag", "FCC"): {"lattice_a": 4.086, "crystallite": 45.0},
+    ("Au", "FCC"): {"lattice_a": 4.078, "crystallite": 45.0},
+    ("Fe", "BCC"): {"lattice_a": 2.866, "crystallite": 50.0},
+    ("Cr", "BCC"): {"lattice_a": 2.884, "crystallite": 50.0},
+    ("W", "BCC"): {"lattice_a": 3.165, "crystallite": 55.0},
+    ("Mo", "BCC"): {"lattice_a": 3.147, "crystallite": 55.0},
+    ("Po", "SC"): {"lattice_a": 3.359, "crystallite": 40.0},
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,11 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--element-b", default=None, help="Optional B element for A(1-x)B(x) solid solutions.")
     parser.add_argument("--composition-x", type=float, default=None, help="Optional B fraction x for A(1-x)B(x).")
     parser.add_argument("--lattice-type", choices=["SC", "BCC", "FCC"], default="FCC", help="Cubic lattice type.")
-    parser.add_argument("--lattice-a", type=float, default=3.615, help="Cubic lattice parameter a in Angstroms.")
-    parser.add_argument("--lattice-a-A", type=float, default=None, help="Endpoint lattice parameter a_A for Vegard's law.")
-    parser.add_argument("--lattice-a-B", type=float, default=None, help="Endpoint lattice parameter a_B for Vegard's law.")
     parser.add_argument("--wavelength", type=float, default=1.5406, help="X-ray wavelength in Angstroms.")
-    parser.add_argument("--crystallite", type=float, default=20.0, help="Crystallite size in nm, typically 10 to 100.")
     parser.add_argument("--two-theta-start", type=float, default=20.0, help="Start angle for simulated 2theta scan.")
     parser.add_argument("--two-theta-stop", type=float, default=90.0, help="Stop angle for simulated 2theta scan.")
     parser.add_argument("--two-theta-step", type=float, default=0.02, help="Step size for simulated 2theta scan.")
@@ -36,20 +45,44 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--instrument-fwhm", type=float, default=0.15, help="Instrumental FWHM broadening in degrees.")
     parser.add_argument("--b-iso", type=float, default=0.5, help="Isotropic Debye-Waller B factor in Angstrom^2.")
     parser.add_argument("--max-index", type=int, default=6, help="Maximum Miller index used for generated reflections.")
+    parser.add_argument("--noise-level", type=float, default=0.025, help="Noise level applied to displayed/saved graph.")
+    parser.add_argument("--background-level", type=float, default=0.04, help="Background level applied to displayed/saved graph.")
+    parser.add_argument("--random-seed", type=int, default=42, help="Random seed for repeatable noisy graph generation.")
     parser.add_argument("--output-profile", default=None, help="Optional CSV path for simulated profile output.")
     parser.add_argument("--output-plot", default=None, help="Optional PNG/PDF path for the XRD plot.")
 
     return parser
 
 
-def resolve_lattice_parameter(args: argparse.Namespace) -> float:
+def _lookup_preset(element: str, lattice_type: str) -> dict[str, float]:
+    key = (element, lattice_type)
+    if key not in MATERIAL_PRESETS:
+        supported = ", ".join(f"{el}-{lat}" for el, lat in sorted(MATERIAL_PRESETS))
+        raise ValueError(
+            f"No built-in preset for {element}-{lattice_type}. "
+            f"Supported presets: {supported}."
+        )
+    return MATERIAL_PRESETS[key]
+
+
+def resolve_material_parameters(args: argparse.Namespace) -> tuple[float, float]:
+    preset_a = _lookup_preset(args.element, args.lattice_type)
+    crystallite_size = preset_a["crystallite"]
+
     if args.composition_x is None:
-        return args.lattice_a
+        return preset_a["lattice_a"], crystallite_size
 
-    if args.lattice_a_A is None or args.lattice_a_B is None:
-        raise ValueError("Vegard's law requires --lattice-a-A and --lattice-a-B with --composition-x.")
+    if args.element_b is None:
+        raise ValueError("--element-b is required with --composition-x.")
 
-    return vegards_law_lattice_parameter(args.composition_x, args.lattice_a_A, args.lattice_a_B)
+    preset_b = _lookup_preset(args.element_b, args.lattice_type)
+    lattice_a = vegards_law_lattice_parameter(
+        args.composition_x,
+        preset_a["lattice_a"],
+        preset_b["lattice_a"],
+    )
+    crystallite_size = (1.0 - args.composition_x) * preset_a["crystallite"] + args.composition_x * preset_b["crystallite"]
+    return lattice_a, crystallite_size
 
 
 def save_profile(path: str, two_theta: np.ndarray, intensity: np.ndarray) -> None:
@@ -83,6 +116,7 @@ def save_xrd_plot(
     max_intensity : float
         Maximum value after normalization.
     """
+    import matplotlib.pyplot as plt
 
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,7 +139,7 @@ def save_xrd_plot(
     plt.xlabel(r"2$\theta$ (degrees)", fontsize=14)
     plt.ylabel("Intensity (a.u.)", fontsize=14)
 
-    plt.xlim(0, 90)
+    plt.xlim(float(two_theta.min()), float(two_theta.max()))
     plt.ylim(0, max_intensity)
 
     plt.xticks(fontsize=12)
@@ -124,7 +158,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        lattice_a = resolve_lattice_parameter(args)
+        lattice_a, crystallite_size = resolve_material_parameters(args)
         sim_two_theta, sim_intensity = simulate_xrd_pattern(
             element_symbol=args.element,
             element_b=args.element_b,
@@ -137,9 +171,16 @@ def main() -> int:
             two_theta_step_deg=args.two_theta_step,
             peak_profile_function=args.profile,
             instrument_fwhm_deg=args.instrument_fwhm,
-            crystallite_size_nm=args.crystallite,
+            crystallite_size_nm=crystallite_size,
             max_index=args.max_index,
             b_iso=args.b_iso,
+        )
+        observed_intensity = add_realistic_xrd_artifacts(
+            sim_two_theta,
+            sim_intensity,
+            noise_fraction=args.noise_level,
+            background_fraction=args.background_level,
+            random_seed=args.random_seed,
         )
         peaks = calculate_xrd_peaks(
             element_symbol=args.element,
@@ -151,7 +192,7 @@ def main() -> int:
             two_theta_start_deg=args.two_theta_start,
             two_theta_stop_deg=args.two_theta_stop,
             instrument_fwhm_deg=args.instrument_fwhm,
-            crystallite_size_nm=args.crystallite,
+            crystallite_size_nm=crystallite_size,
             max_index=args.max_index,
             b_iso=args.b_iso,
         )
@@ -163,11 +204,13 @@ def main() -> int:
     print(f"Crystal name          : {args.crystal_name}")
     print(f"Composition           : {args.element}" + (f"(1-x){args.element_b}(x), x={args.composition_x:.4f}" if args.composition_x is not None else ""))
     print(f"Lattice type          : {args.lattice_type}")
-    print(f"Lattice parameter a   : {lattice_a:.4f} Angstrom")
+    print(f"Internal assumed a    : {lattice_a:.4f} Angstrom")
     print(f"Wavelength            : {args.wavelength:.4f} Angstrom")
-    print(f"Crystallite size      : {args.crystallite:.2f} nm")
+    print(f"Internal crystallite  : {crystallite_size:.2f} nm")
     print(f"Instrument FWHM       : {args.instrument_fwhm:.4f} deg")
     print(f"Debye-Waller B_iso    : {args.b_iso:.4f} Angstrom^2")
+    print(f"Graph noise level     : {args.noise_level:.4f}")
+    print(f"Graph background      : {args.background_level:.4f}")
     print(f"Peak profile          : {args.profile}")
     print(f"2theta range          : {args.two_theta_start:.2f} to {args.two_theta_stop:.2f} deg")
     print(f"2theta step           : {args.two_theta_step:.4f} deg")
@@ -197,11 +240,11 @@ def main() -> int:
         print("\nNo peaks fall inside the selected 2theta range.")
 
     if args.output_profile:
-        save_profile(args.output_profile, sim_two_theta, sim_intensity)
+        save_profile(args.output_profile, sim_two_theta, observed_intensity)
         print(f"\nSaved simulated profile: {args.output_profile}")
 
     if args.output_plot:
-        save_xrd_plot(args.output_plot, sim_two_theta, sim_intensity)
+        save_xrd_plot(args.output_plot, sim_two_theta, observed_intensity)
         print(f"Saved XRD plot: {args.output_plot}")
 
     print("---------------------------------------------")
