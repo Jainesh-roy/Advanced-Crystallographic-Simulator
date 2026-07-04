@@ -104,24 +104,12 @@ def save_xrd_plot(
 ):
     """
     Save the simulated XRD profile as a publication-style plot.
-
-    Parameters
-    ----------
-    path : str
-        Output image filename (.png/.pdf/.svg)
-    two_theta : ndarray
-        2θ values (degrees)
-    intensity : ndarray
-        Simulated intensity
-    max_intensity : float
-        Maximum value after normalization.
     """
     import matplotlib.pyplot as plt
 
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Normalize intensity
     if np.max(intensity) > 0:
         intensity_norm = intensity / np.max(intensity) * max_intensity
     else:
@@ -182,6 +170,8 @@ def main() -> int:
             background_fraction=args.background_level,
             random_seed=args.random_seed,
         )
+        
+        # Added peak_profile_function=args.profile to ensure math matches the simulation
         peaks = calculate_xrd_peaks(
             element_symbol=args.element,
             element_b=args.element_b,
@@ -195,6 +185,7 @@ def main() -> int:
             crystallite_size_nm=crystallite_size,
             max_index=args.max_index,
             b_iso=args.b_iso,
+            peak_profile_function=args.profile, 
         )
     except Exception as exc:
         print(f"Failed to simulate XRD pattern: {exc}")
