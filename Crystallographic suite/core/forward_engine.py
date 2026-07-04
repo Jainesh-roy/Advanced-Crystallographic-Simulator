@@ -95,6 +95,7 @@ def _scherrer_fwhm_deg(
     wavelength_angstrom: float,
     crystallite_size_nm: float | None,
     instrument_fwhm_deg: float,
+    profile_type: PeakProfile = "Lorentzian",
 ) -> float:
     if instrument_fwhm_deg < 0:
         raise ValueError("instrument_fwhm_deg must be non-negative.")
@@ -106,7 +107,11 @@ def _scherrer_fwhm_deg(
     crystallite_size_angstrom = crystallite_size_nm * 10.0
     beta_rad = (0.9 * wavelength_angstrom) / (crystallite_size_angstrom * np.cos(theta_rad))
     beta_deg = float(np.degrees(beta_rad))
-    return float(np.sqrt(instrument_fwhm_deg**2 + beta_deg**2))
+    
+    if profile_type == "Gaussian":
+        return float(np.sqrt(instrument_fwhm_deg**2 + beta_deg**2))
+    else:  # Lorentzian
+        return float(instrument_fwhm_deg + beta_deg)
 
 
 def lorentz_polarization_factor(theta_rad: float) -> float:
@@ -143,6 +148,7 @@ def calculate_xrd_peaks(
     element_b: str | None = None,
     composition_x: float | None = None,
     b_iso: float = 0.5,
+    peak_profile_function: PeakProfile = "Lorentzian",
 ) -> list[XRDPeak]:
     """
     Calculate Bragg peak positions and relative intensities for cubic XRD.
@@ -185,11 +191,14 @@ def calculate_xrd_peaks(
         lp_factor = lorentz_polarization_factor(theta_rad)
         dw_factor = debye_waller_factor(theta_rad, wavelength_angstrom, b_iso)
         intensity = multiplicity * structure_factor_abs**2 * lp_factor * dw_factor
+        
+        # Pass the profile type into the FWHM calculation
         fwhm_deg = _scherrer_fwhm_deg(
             theta_rad,
             wavelength_angstrom,
             crystallite_size_nm,
             instrument_fwhm_deg,
+            profile_type=peak_profile_function,
         )
 
         peaks.append(
@@ -262,6 +271,7 @@ def simulate_xrd_pattern(
     )
     intensity_total = np.zeros_like(two_theta_deg)
 
+    # Pass the peak_profile_function to calculate_xrd_peaks
     peaks = calculate_xrd_peaks(
         element_symbol=element_symbol,
         lattice_type=lattice_type,
@@ -275,6 +285,7 @@ def simulate_xrd_pattern(
         element_b=element_b,
         composition_x=composition_x,
         b_iso=b_iso,
+        peak_profile_function=peak_profile_function,
     )
 
     for peak in peaks:
@@ -310,10 +321,6 @@ def add_realistic_xrd_artifacts(
 ) -> np.ndarray:
     """
     Add a mild background and counting noise so the profile resembles lab XRD.
-
-    The peak positions and peak areas still come from the forward model; this
-    function only decorates the displayed/saved graph with experimental-looking
-    baseline and stochastic noise.
     """
     if noise_fraction < 0 or background_fraction < 0 or slope_fraction < 0:
         raise ValueError("Noise and background fractions must be non-negative.")
