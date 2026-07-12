@@ -186,3 +186,41 @@ def run_signal_pipeline(
         'corrected_two_theta'  : corrected_two_theta,
         'zero_point_shift_deg': shift
     }
+
+
+#___________________________________________________________________________________________________
+# 5. BASELINE SUBTRACTION - Rolling Minimum 
+
+
+def subtract_baseline(
+    intensity: np.ndarray,
+    window_size: int = 150
+) -> np.ndarray:
+    n = len(intensity)
+    half_w = window_size // 2
+
+    padded  = np.pad(intensity, pad_width=half_w, mode='edge')
+    shape   = (n, window_size)
+    strides = (padded.strides[0], padded.strides[0])
+    windows = np.lib.stride_tricks.as_strided(padded, shape=shape, strides=strides)
+
+    baseline = windows.min(axis=1)
+    return np.clip(intensity - baseline, 0.0, None)
+
+
+#__________________________________________________________________________________________________
+# 6. CLEAN_PROFILE - Unified API Contract 
+
+
+def clean_profile(
+    two_theta: np.ndarray,
+    intensity: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    
+    if two_theta.shape != intensity.shape:
+        raise ValueError("two_theta and intensity must be the same length.")
+
+    smoothed = apply_savitzky_golay_filter(intensity)
+    cleaned  = subtract_baseline(smoothed)
+
+    return two_theta, cleaned
