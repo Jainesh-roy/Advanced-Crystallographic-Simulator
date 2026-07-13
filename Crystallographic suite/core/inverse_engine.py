@@ -16,7 +16,6 @@
 import os
 import json
 import numpy as np
-from scipy.signal import find_peaks
 from signal_processor import clean_profile
 
 
@@ -145,42 +144,60 @@ def match_peaks_to_reference(
     results = []
 
     for ref_file in reference_files:
-        ref_path   = os.path.join(simulated_dir, ref_file)
+        ref_path = os.path.join(simulated_dir, ref_file)
         phase_name = os.path.splitext(ref_file)[0]
 
         try:
             ref_theta, ref_intensity = load_reference_pattern(ref_path)
 
-            threshold    = 0.05 * ref_intensity.max()
-            ref_peak_idx = np.where(ref_intensity >= threshold)[0]
-            ref_peaks    = ref_theta[ref_peak_idx]
+            ref_peak_data = extract_experimental_peaks(
+                ref_theta,
+                ref_intensity,
+                min_relative_height=0.05,
+                min_distance_points=3,
+                min_prominence=0.0
+            )
+            ref_peaks = ref_peak_data["positions"]
+
+            if len(ref_peaks) == 0:
+                threshold = 0.05 * ref_intensity.max() if ref_intensity.max() > 0 else np.inf
+                ref_peak_idx = np.where(ref_intensity >= threshold)[0]
+                ref_peaks = ref_theta[ref_peak_idx]
 
             matched = 0
+            used_ref_indices = set()
+
             for exp_pos in exp_peak_positions:
-                if np.any(np.abs(ref_peaks - exp_pos) <= tolerance_deg):
+                if len(ref_peaks) == 0:
+                    break
+
+                diffs = np.abs(ref_peaks - exp_pos)
+                closest_idx = int(np.argmin(diffs))
+
+                if diffs[closest_idx] <= tolerance_deg and closest_idx not in used_ref_indices:
+                    used_ref_indices.add(closest_idx)
                     matched += 1
 
             score = matched / len(ref_peaks) if len(ref_peaks) > 0 else 0.0
 
             results.append({
-                "phase_name"      : phase_name,
-                "match_score"     : round(score, 4),
-                "matched_peaks"   : matched,
-                "total_ref_peaks" : len(ref_peaks)
+                "phase_name": phase_name,
+                "match_score": round(score, 4),
+                "matched_peaks": matched,
+                "total_ref_peaks": len(ref_peaks)
             })
 
         except Exception as e:
             results.append({
-                "phase_name"      : phase_name,
-                "match_score"     : 0.0,
-                "matched_peaks"   : 0,
-                "total_ref_peaks" : 0,
-                "error"           : str(e)
+                "phase_name": phase_name,
+                "match_score": 0.0,
+                "matched_peaks": 0,
+                "total_ref_peaks": 0,
+                "error": str(e)
             })
 
     results.sort(key=lambda x: x["match_score"], reverse=True)
     return results
-
 
 #_______________________________________________________________________________________________________________
 # 6. IDENTIFY PHASES
@@ -193,22 +210,14 @@ def identify_phases(file_path: str) -> dict:
 
         two_theta_clean, cleaned_intensity = clean_profile(two_theta, raw_intensity)
 
-        try:
-            from inverse_engine import extract_experimental_peaks
-            peak_data          = extract_experimental_peaks(
-                two_theta_clean,
-                cleaned_intensity,
-                min_prominence=0.05 * cleaned_intensity.max()
-            )
-            exp_peak_positions = peak_data["positions"]
-
-        except (ImportError, KeyError):
-            peak_idx, _        = find_peaks(
-                cleaned_intensity,
-                height=0.05 * cleaned_intensity.max(),
-                distance=10
-            )
-            exp_peak_positions = two_theta_clean[peak_idx]
+            peak_data = extract_experimental_peaks(
+            two_theta_clean,
+            cleaned_intensity,
+            min_relative_height=0.05,
+            min_distance_points=5,
+            min_prominence=0.02 * np.max(cleaned_intensity) if np.max(cleaned_intensity) > 0 else 0.0
+        )
+        exp_peak_positions = peak_data["positions"]
 
         match_results = match_peaks_to_reference(exp_peak_positions)
 
@@ -236,15 +245,20 @@ def identify_phases(file_path: str) -> dict:
             for m in top_matches
         ]
 
-        return {
-            "success"           : True,
-            "R_wp"              : round(rwp_value, 6),
-            "identified_phases" : identified_phases,
-            "cleaned_profile"   : {
-                "two_theta" : two_theta_clean.tolist(),
-                "intensity" : cleaned_intensity.tolist()
+            return {
+            "success": True,
+            "R_wp": round(rwp_value, 6),
+            "identified_phases": identified_phases,
+            "detected_peaks": {
+                "positions": peak_data["positions"].tolist(),
+                "intensities": peak_data["intensities"].tolist(),
+                "relative_intensities": peak_data["relative_intensities"].tolist()
             },
-            "match_details"     : match_results
+            "cleaned_profile": {
+                "two_theta": two_theta_clean.tolist(),
+                "intensity": cleaned_intensity.tolist()
+            },
+            "match_details": match_results
         }
 
     except Exception as e:
