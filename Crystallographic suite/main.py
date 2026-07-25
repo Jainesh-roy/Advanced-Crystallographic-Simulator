@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import json
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,14 @@ from core.forward_engine import (
     simulate_xrd_pattern,
     vegards_law_lattice_parameter,
 )
+
+# New import for Phase 2 Backward Engine
+try:
+    from core.inverse_engine import identify_phases, save_metrics
+except ImportError:
+    identify_phases = None
+    save_metrics = None
+
 
 MATERIAL_PRESETS = {
     ("Cu", "FCC"): {"lattice_a": 3.615, "crystallite": 45.0},
@@ -29,9 +38,20 @@ MATERIAL_PRESETS = {
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Phase 1 cubic XRD forward simulator for SC/BCC/FCC crystals."
+        description="Unified XRD Simulator: Forward Generation & Backward Identification."
     )
 
+    # Mode selection
+    parser.add_argument(
+        "--mode",
+        choices=["forward", "backward"],
+        default="forward",
+        help="Run the forward simulation engine or the backward phase identification engine."
+    )
+
+    # ---------------------------------------------------------
+    # Forward Engine Arguments
+    # ---------------------------------------------------------
     parser.add_argument("--crystal-name", default="User crystal", help="Display name for the crystal/material.")
     parser.add_argument("--element", default="Cu", help="Primary element symbol, e.g. Cu, Fe, Au.")
     parser.add_argument("--element-b", default=None, help="Optional B element for A(1-x)B(x) solid solutions.")
@@ -50,6 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--random-seed", type=int, default=42, help="Random seed for repeatable noisy graph generation.")
     parser.add_argument("--output-profile", default=None, help="Optional CSV path for simulated profile output.")
     parser.add_argument("--output-plot", default=None, help="Optional PNG/PDF path for the XRD plot.")
+
+    # ---------------------------------------------------------
+    # Backward Engine Arguments
+    # ---------------------------------------------------------
+    parser.add_argument("--input-experimental", default=None, help="Path to experimental raw data file (CSV/TXT) for backward engine.")
 
     return parser
 
@@ -141,10 +166,7 @@ def save_xrd_plot(
     plt.close()
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-
+def run_forward_engine(args: argparse.Namespace) -> int:
     try:
         lattice_a, crystallite_size = resolve_material_parameters(args)
         sim_two_theta, sim_intensity = simulate_xrd_pattern(
@@ -171,7 +193,6 @@ def main() -> int:
             random_seed=args.random_seed,
         )
         
-        # Added peak_profile_function=args.profile to ensure math matches the simulation
         peaks = calculate_xrd_peaks(
             element_symbol=args.element,
             element_b=args.element_b,
@@ -240,6 +261,58 @@ def main() -> int:
 
     print("---------------------------------------------")
     return 0
+
+
+def run_backward_engine(args: argparse.Namespace) -> int:
+    if identify_phases is None:
+        print("Error: Could not import backward engine modules. Is core/inverse_engine.py present?")
+        return 1
+
+    if not args.input_experimental:
+        print("Error: --input-experimental is required when running in backward mode.")
+        return 1
+
+    print("\n--- Phase 2: Backward Phase Identification Engine ---")
+    print(f"Analyzing file: {args.input_experimental}\n")
+    
+    results = identify_phases(args.input_experimental)
+    
+    if not results.get("success"):
+        print(f"Phase identification failed: {results.get('error', 'Unknown error')}")
+        return 1
+        
+    print(f"Analysis Complete. Profile R_wp: {results['R_wp']:.6f}")
+    
+    if results.get("identified_phases"):
+        print("\nIdentified Phases:")
+        for phase in results["identified_phases"]:
+            print(f"  - {phase['name']}: {phase['fraction']*100:.1f}%")
+    else:
+        print("\nNo phases could be definitively matched.")
+        
+    if results.get("match_details"):
+        print("\nDetailed Match Scores:")
+        for match in results["match_details"]:
+            print(f"  {match['phase_name']:10} | Score: {match['match_score']:.4f} | Peaks: {match['matched_peaks']}/{match['total_ref_peaks']}")
+
+    if save_metrics:
+        out_path = save_metrics(results, run_id=Path(args.input_experimental).stem)
+        print(f"\nMetrics exported to: {out_path}")
+        
+    print("---------------------------------------------")
+    return 0
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.mode == "forward":
+        return run_forward_engine(args)
+    elif args.mode == "backward":
+        return run_backward_engine(args)
+    
+    return 1
 
 
 if __name__ == "__main__":
