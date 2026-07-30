@@ -2,7 +2,7 @@
 
 An integrated computational software platform that combines first-principles crystallographic calculations with modern deep learning techniques to perform both **Forward XRD Simulation** and **AI-Based Backward Material Identification** within a unified PySide6 desktop dashboard.
 
-Developed by **Jainesh Roy (Roll No: 250005019)** and team members from the Department of Metallurgical Engineering and Materials Science, Indian Institute of Technology Indore.
+Developed by **Jainesh Roy, Anand Madhav Gupta, Shreyas Deosthali, Monish R** from the Department of Metallurgical Engineering and Materials Science, Indian Institute of Technology Indore.
 
 ---
 
