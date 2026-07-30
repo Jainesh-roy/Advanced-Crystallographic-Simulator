@@ -13,8 +13,7 @@
 import os
 import json
 import numpy as np
-from signal_processor import clean_profile
-
+from .signal_processor import clean_profile
 
 # _______________________________________________________________________________________________________________
 # 1. LOAD EXPERIMENTAL DATA
@@ -27,9 +26,19 @@ def load_experimental_data(file_path: str) -> tuple[np.ndarray, np.ndarray]:
         )
 
     try:
-        data = np.loadtxt(file_path, comments="#", delimiter=None)
-        if data.ndim != 2 or data.shape[1] < 2:
-            data = np.loadtxt(file_path, comments="#", delimiter=",")
+        try:
+            data = np.loadtxt(
+            file_path,
+            comments="#",
+            delimiter=",",
+            skiprows=1
+        )
+        except Exception:
+            data = np.loadtxt(
+            file_path,
+            comments="#",
+            skiprows=1
+        )
     except Exception as e:
         raise ValueError(f"Could not parse {file_path}: {e}")
 
@@ -38,7 +47,6 @@ def load_experimental_data(file_path: str) -> tuple[np.ndarray, np.ndarray]:
 
     return two_theta_deg, raw_intensity
 
-
 # _______________________________________________________________________________________________________________
 # 2. LOAD REFERENCE PATTERN
 
@@ -46,7 +54,7 @@ def load_reference_pattern(simulated_path: str) -> tuple[np.ndarray, np.ndarray]
     if not os.path.exists(simulated_path):
         raise FileNotFoundError(
             f"Reference pattern not found: {simulated_path}\n"
-            f"Run the Forward Engine first to generate Data/Simulated/ files."
+            f"Run the Forward Engine first to generate Data/Reference/ files."
         )
 
     data = np.loadtxt(simulated_path, comments="#", delimiter=",")
@@ -160,7 +168,7 @@ def extract_experimental_peaks(
 
             left_min = np.min(intensity[left:i + 1]) if i > left else intensity[i]
             right_min = np.min(intensity[i:right]) if right > i else intensity[i]
-            local_prominence = intensity[i] - max(left_min, right_min)
+            local_prominence = intensity[i] - min(left_min, right_min)
 
             if local_prominence >= min_prominence:
                 candidate_indices.append(i)
@@ -196,13 +204,13 @@ def extract_experimental_peaks(
 
 def match_peaks_to_reference(
     exp_peak_positions: np.ndarray,
-    simulated_dir: str = "Data/Simulated/",
+    simulated_dir: str = "Data/Reference/",
     tolerance_deg: float = 0.3
 ) -> list[dict]:
     if not os.path.exists(simulated_dir):
         raise FileNotFoundError(
             f"Simulated directory not found: {simulated_dir}\n"
-            "Run the Forward Engine to populate Data/Simulated/."
+            "Run the Forward Engine to populate Data/Reference/."
         )
 
     reference_files = [
@@ -307,6 +315,9 @@ def identify_phases(file_path: str) -> dict:
                     ref_theta,
                     ref_intensity
                 )
+                exp_grid = exp_grid / np.max(exp_grid)
+                ref_grid = ref_grid / np.max(ref_grid)
+
                 rwp_value = compute_rwp(exp_grid, ref_grid)
 
         top_matches = [m for m in match_results if m["match_score"] > 0.1][:3]

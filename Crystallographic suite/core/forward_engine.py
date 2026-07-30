@@ -308,7 +308,7 @@ def simulate_xrd_pattern(
 
         intensity_total += profile
 
-    return two_theta_deg, intensity_total
+    return two_theta_deg, intensity_total, peaks
 
 
 def add_realistic_xrd_artifacts(

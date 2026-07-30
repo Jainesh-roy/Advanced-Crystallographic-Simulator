@@ -1,0 +1,31 @@
+{
+  "success": true,
+  "R_wp": 1.0,
+  "identified_phases": [],
+  "detected_peaks": {
+    "positions": [
+      43.83999999999949,
+      51.059999999999334,
+      75.11999999999883
+    ],
+    "intensities": [
+      1014.0282837316307,
+      475.9115759158012,
+      267.3116905311347
+    ],
+    "relative_intensities": [
+      1.0,
+      0.4693277135864924,
+      0.2636136435439709
+    ]
+  },
+  "match_details": [
+    {
+      "phase_name": "Test",
+      "match_score": 0.0,
+      "matched_peaks": 0,
+      "total_ref_peaks": 0,
+      "error": "too many indices for array: array is 1-dimensional, but 2 were indexed"
+    }
+  ]
+}
